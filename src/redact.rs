@@ -474,6 +474,10 @@ fn redact_ir_inner(
                 reason: RedactReason::StrategyReject,
             });
         }
+        // 位置统计 (替换前, 只读): 仅对命中的 secret 执行, 与替换遍历同阶
+        // (USAGE-7 治理归因 — 哪个环节把 secret 塞进来; monitor 分支消费同一
+        // 份统计进审计通道, reject 在上方已提前 return 不需要).
+        let locations = count_hit_locations(ir, &secret.value);
         // strategy=monitor (#410, RED-9): 真值命中 → 放行 (IR 零改写, 无 mock 生成,
         // 不入 allocated) + 位置统计进审计通道。真值对上游可见是显式授权 (非降级,
         // on_probe_exhausted 不适用)。遮蔽边界 (同值多 entry 先者胜 / 长 redact 值
@@ -483,13 +487,9 @@ fn redact_ir_inner(
         // 是 mock — 审计的 "(passthrough)" 指策略处理而非逐字节原样, 见 RED-9
         // 遍历顺序边界第三条。
         if secret.strategy == crate::secrets::SecretStrategy::Monitor {
-            let locations = count_hit_locations(ir, &secret.value);
             map.monitor_hits.push((secret.id.clone(), locations));
             continue;
         }
-        // 位置统计 (替换前, 只读): 仅对命中的 secret 执行, 与替换遍历同阶
-        // (USAGE-7 治理归因 — 哪个环节把 secret 塞进来).
-        let locations = count_hit_locations(ir, &secret.value);
         // strategy=placeholder (C9, RED-10, #305 批2): 真值 → 明示假值
         // `[REDACTED:{id}]` (确定性, 不走 probing — mock 生成跳过), 响应侧不还原
         // (placeholder_reals 标记, restore 投影跳过). IR 已含 placeholder

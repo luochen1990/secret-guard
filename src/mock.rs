@@ -441,6 +441,30 @@ pub const USERNAME_SEPS: &[char] = &['_', '.', '-'];
 /// `first.last`, 不引入 `_`/`-` 保持拟真).
 pub const EMAIL_LOCAL_SEPS: &[char] = &['.'];
 
+/// sep 覆盖判定 (charset 校验侧, validate 用): '_'/'-' 有专用 flag 变体
+/// (任一即算覆盖), 其余字符只认 `other` 显式成员.
+fn sep_covered(cs: &Charset, c: char) -> bool {
+    match c {
+        '_' => cs.underscore || cs.other.contains(&c),
+        '-' => cs.hyphen || cs.other.contains(&c),
+        _ => cs.other.contains(&c),
+    }
+}
+
+/// 强制 charset 覆盖 name-like 产出面 (infer 侧): lowercase + digits + seps
+/// 归一进 other (只增不减). 与 [`sep_covered`] 是同一知识的两面 — seps 清单
+/// 恒引用 [`EMAIL_LOCAL_SEPS`]/[`USERNAME_SEPS`] 常量 (生成器/空间计算同源),
+/// 防手抄清单漂移导致 RED-1 静默破约.
+fn force_name_face(cs: &mut Charset, seps: &[char]) {
+    cs.lowercase = true;
+    cs.digits = true;
+    for &c in seps {
+        if !cs.other.contains(&c) {
+            cs.other.push(c);
+        }
+    }
+}
+
 /// real 的公开 API key 前缀 (白名单最长命中). body (去前缀后) < 8 chars 时返回
 /// `None` — 短 body 前缀保留意义弱 (仿真增益小) 且 C5 随机窗口空间过窄.
 fn find_public_prefix(real: &str) -> Option<&'static str> {
@@ -824,22 +848,8 @@ impl GenSpec {
         // 推断 gate 已保证 digit ≥ 7 → 10^7 > 2^20).
         let mut skip_widen = false;
         match &shape {
-            SecretShape::Email { .. } => {
-                charset.lowercase = true;
-                charset.digits = true;
-                if !charset.other.contains(&'.') {
-                    charset.other.push('.');
-                }
-            }
-            SecretShape::Username => {
-                charset.lowercase = true;
-                charset.digits = true;
-                for c in ['_', '.', '-'] {
-                    if !charset.other.contains(&c) {
-                        charset.other.push(c);
-                    }
-                }
-            }
+            SecretShape::Email { .. } => force_name_face(&mut charset, EMAIL_LOCAL_SEPS),
+            SecretShape::Username => force_name_face(&mut charset, USERNAME_SEPS),
             SecretShape::Phone { .. } => {
                 charset = Charset {
                     digits: true,
@@ -1019,12 +1029,14 @@ impl GenSpec {
                     ));
                 }
                 // RED-1 charset 合规的结构保证 (镜像 infer 路径的强制, phone
-                // digits-only 同型): Email 的 local 段由名字池 (小写) + sep '.'
-                // + digit pad 生成 — 不从 charset 采样, charset 必须覆盖产出面,
-                // 手动配置经此拦截 (否则 mock 字符越出声明 charset).
+                // digits-only 同型): Email 的 local 段由名字池 (小写) +
+                // EMAIL_LOCAL_SEPS + digit pad 生成 — 不从 charset 采样, charset
+                // 必须覆盖产出面, 手动配置经此拦截 (否则 mock 字符越出声明 charset).
                 if !(self.charset.lowercase
                     && self.charset.digits
-                    && self.charset.other.contains(&'.'))
+                    && EMAIL_LOCAL_SEPS
+                        .iter()
+                        .all(|&c| sep_covered(&self.charset, c)))
                 {
                     return Err("shape.email charset must cover the name-like output face: \
                          lowercase + digits + '.' separator in other (mock chars ⊆ \
@@ -1077,13 +1089,12 @@ impl GenSpec {
             // Username 无结构字段 (prefix 空已由上方通用规则强制); length_range
             // 区间允许非单点 (生成器按区间 hash 选 target, 同 Plain 的 body 长度选择).
             // charset 强制 (RED-1, 同 Email): 产出面 = 名字池 (小写) +
-            // USERNAME_SEPS ('_'/'.'/'-') + digit pad; '_'/'-' 可经 flag 或 other 覆盖.
+            // USERNAME_SEPS + digit pad; sep 覆盖判定见 `sep_covered` ('_'/'-'
+            // 可经 flag 或 other — flag 变体).
             SecretShape::Username => {
                 if !(self.charset.lowercase
                     && self.charset.digits
-                    && self.charset.other.contains(&'.')
-                    && (self.charset.underscore || self.charset.other.contains(&'_'))
-                    && (self.charset.hyphen || self.charset.other.contains(&'-')))
+                    && USERNAME_SEPS.iter().all(|&c| sep_covered(&self.charset, c)))
                 {
                     return Err(
                         "shape.username charset must cover the name-like output face: \
@@ -1157,7 +1168,9 @@ impl GenSpec {
     /// (prefix 恒空, 区间原样保留 — 生成器按区间 hash 选 target).
     fn body_length_range(&self) -> (usize, usize) {
         match &self.shape {
-            SecretShape::Plain | SecretShape::PublicPrefixed { .. } => {
+            // Username 归平坦族 (validate 强制非 Plain 形状 prefix 为空, 公式与
+            // Plain 同构): length_range 区间原样 (生成器按区间 hash 选 target).
+            SecretShape::Plain | SecretShape::PublicPrefixed { .. } | SecretShape::Username => {
                 let prefix_len = self.flat_fixed_prefix().chars().count();
                 (
                     self.length_range.0.saturating_sub(prefix_len),
@@ -1187,13 +1200,6 @@ impl GenSpec {
                 // 随机位 = skeleton 的 '#' 占位数 (literal 分隔符不计入).
                 let digits = skeleton.chars().filter(|&c| c == '#').count();
                 (digits, digits)
-            }
-            SecretShape::Username => {
-                let prefix_len = self.flat_fixed_prefix().chars().count();
-                (
-                    self.length_range.0.saturating_sub(prefix_len),
-                    self.length_range.1.saturating_sub(prefix_len),
-                )
             }
         }
     }
@@ -1813,6 +1819,15 @@ fn gen_one_auto_body(
             })
             .collect()
     };
+    // hash 选区间长度 (单点直取; 生成流 "len" tag 单源 — Plain body 与
+    // Username target 共用同一选择逻辑).
+    let pick_len = |lo: usize, hi: usize| -> usize {
+        if lo == hi {
+            return lo;
+        }
+        let h = crate::util::hash64(&format!("{seed}{counter}{retry}len"));
+        lo + (h % (hi - lo + 1) as u64) as usize
+    };
 
     match &gen_spec.shape {
         SecretShape::Plain | SecretShape::PublicPrefixed { .. } => {
@@ -1820,12 +1835,7 @@ fn gen_one_auto_body(
             // (body 长度按 length_range - 前缀长).
             let fixed_prefix = gen_spec.flat_fixed_prefix();
             let (body_min, body_max) = gen_spec.body_length_range();
-            let body_len = if body_min == body_max {
-                body_min
-            } else {
-                let h = crate::util::hash64(&format!("{seed}{counter}{retry}len"));
-                body_min + (h % (body_max - body_min + 1) as u64) as usize
-            };
+            let body_len = pick_len(body_min, body_max);
             let mut buf = String::with_capacity(fixed_prefix.chars().count() + body_len);
             buf.push_str(fixed_prefix);
             buf.push_str(&random_chars(0, body_len));
@@ -1862,9 +1872,8 @@ fn gen_one_auto_body(
         }
         SecretShape::Email { domain } => {
             // local = name-like 生成, 输出 local + '@' + domain (domain 公开段
-            // 白名单复用; local_len = 总长 (单点) - '@' - domain 长).
-            let domain_len = domain.chars().count();
-            let local_len = gen_spec.length_range.0.saturating_sub(1 + domain_len);
+            // 白名单复用; local_len 与 body_length_range 单源).
+            let (local_len, _) = gen_spec.body_length_range();
             let local = gen_name_like(local_len, EMAIL_LOCAL_SEPS, seed, counter, retry, pool);
             format!("{local}@{domain}")
         }
@@ -1884,15 +1893,10 @@ fn gen_one_auto_body(
             buf
         }
         SecretShape::Username => {
-            // 区间非单点 (手动配置) 时 hash 选 target 长度 (同 Plain 的 body
-            // 长度选择逻辑); infer 出恒单点.
+            // 区间非单点 (手动配置) 时 hash 选 target 长度 (pick_len, 同 Plain
+            // body 长度选择); infer 出恒单点.
             let (min, max) = gen_spec.body_length_range();
-            let target = if min == max {
-                min
-            } else {
-                let h = crate::util::hash64(&format!("{seed}{counter}{retry}len"));
-                min + (h % (max - min + 1) as u64) as usize
-            };
+            let target = pick_len(min, max);
             gen_name_like(target, USERNAME_SEPS, seed, counter, retry, pool)
         }
     }
