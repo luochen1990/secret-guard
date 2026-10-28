@@ -490,10 +490,13 @@ in
                   "token"
                   "cookie"
                   "privatekey"
+                  "email"
+                  "phone"
+                  "username"
                   "other"
                 ];
                 default = "apikey";
-                description = "类别 (影响 mock 生成策略, 对齐上游 SecretCategory serde lowercase 命名).";
+                description = "类别 (影响 mock 生成策略, 对齐上游 SecretCategory serde lowercase 命名). email/phone/username 触发拟真 mock 形状 (#410).";
               };
               strategy = lib.mkOption {
                 type = lib.types.enum [
@@ -501,9 +504,10 @@ in
                   "protect"
                   "placeholder"
                   "reject"
+                  "monitor"
                 ];
                 default = "redact";
-                description = "per-secret 处理策略 (对齐上游 SecretStrategy): redact = 替换为 mock (默认); reject = 请求中检测到即拒绝整个请求 (503, 零上游外发); placeholder = 替换为明示假值 [REDACTED:{id}] + 响应侧不还原 + 泄露蜜罐检测. protect 已搁置 (#305 完结决策) — nix 侧接受四值透传 (单一事实源: 值合法性由 rust validate 启动时报错挡下, 而非 eval 期), 选中会在启动时 fail-fast.";
+                description = "per-secret 处理策略 (对齐上游 SecretStrategy): redact = 替换为 mock (默认); reject = 请求中检测到即拒绝整个请求 (503, 零上游外发); placeholder = 替换为明示假值 [REDACTED:{id}] + 响应侧不还原 + 泄露蜜罐检测; monitor = 真值命中时原样放行 + 计入脱敏审计 (usage redacts 视图显示 \"(passthrough)\"), 适合 agent 需要真值工作的场景如 email (#410). protect 已搁置 (#305 完结决策) — nix 侧接受五值透传 (单一事实源: 值合法性由 rust validate 启动时报错挡下, 而非 eval 期), 选中会在启动时 fail-fast.";
               };
               valueFile = lib.mkOption {
                 type = lib.types.path;

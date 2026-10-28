@@ -466,6 +466,29 @@ let
         (builtins.elemAt (builtins.fromTOML t).secrets.entries 0).strategy == "reject";
     }
     {
+      # #410 枚举扩容的新值透传 (email/phone/username/monitor) — 拿 email + monitor
+      # 代表性覆盖; 其余新值经同一透传路径, rust validate 启动期把关值域.
+      name = "secrets.entries: category 显式 email + strategy 显式 monitor 透传";
+      ok =
+        let
+          t = render (
+            baseArgs
+            // {
+              secretsEntries = [
+                {
+                  id = "k";
+                  valueFile = "/x";
+                  category = "email";
+                  strategy = "monitor";
+                }
+              ];
+            }
+          );
+          e = builtins.elemAt (builtins.fromTOML t).secrets.entries 0;
+        in
+        e.category == "email" && e.strategy == "monitor";
+    }
+    {
       name = "auth 段: enabled + oidc 字段 + clientSecretFile 直通 + apiKeys keyFile";
       ok =
         parsed.auth.enabled == true
