@@ -50,7 +50,10 @@ Return:    local tools ◄──real Secret──  secret-guard  ◄──Mock r
   "placeholder"` to swap it for an explicit `[REDACTED:{id}]` token that is never
   restored. Every placeholder secret doubles as a canary: if its real value ever shows
   up in an LLM response, you get an alert (WARN log + WebUI timeline badge, no secret
-  values in the alert) while the response itself passes through untouched.
+  values in the alert) while the response itself passes through untouched. Or `strategy
+  = "monitor"` for values the agent genuinely needs verbatim (an email address, say):
+  the real value passes through unchanged, and every hit is recorded to the redactions
+  audit (shown as "(passthrough)" in the usage view).
 - **Built-in protection for Secret Guard's own credentials**: the sg API tokens it
   issues (and the provider API keys you register with it) are protected automatically —
   zero configuration, effective the instant a token is created. If a prompt injection

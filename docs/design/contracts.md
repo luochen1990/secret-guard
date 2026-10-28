@@ -522,13 +522,18 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 
 **陈述**: mock 不含 real_secret 的 ≥ `k(L)=max(4, ⌈L/3⌉)` 字符连续子串. 阈值随 secret 长度 L 自适应 (短 secret 强保护, 长 secret 弱保护, 信息泄露率上界 ~36%).
 
-> **公开格式子串豁免 (2026-10, category-aware shape 精确化)**: SecretShape 的公开
-> 结构段 — PublicPrefixed 的白名单前缀 (sk-/ghp_/AKIA..., `src/mock.rs` 的
-> `PUBLIC_KEY_PREFIXES`) 与 Pem 的 BEGIN/END 边界行 — 是 real 中**信息量为零的公开
-> 格式串** (业界约定, 非 secret 内容), mock 复用它们不泄露任何 secret 信息. C5 检查
-> (`src/mock.rs` 的 `c5_violated`) 在窗口比较前剥离 mock 的公开段, 随机部分照常做
-> ≥k 子串窗口检查 (Auto 模式重试链语义不变). 豁免只覆盖公开段本身: 随机部分撞上
-> real 任意 ≥k 窗口仍算违反.
+> **公开格式子串豁免 (2026-10, category-aware shape 精确化; #410 扩展 Email)**:
+> SecretShape 的公开结构段 — PublicPrefixed 的白名单前缀 (sk-/ghp_/AKIA...,
+> `src/mock.rs` 的 `PUBLIC_KEY_PREFIXES`) / Pem 的 BEGIN/END 边界行 / Email 的
+> `@domain` 白名单域名段 (`src/mock.rs` 的 `EMAIL_DOMAINS`) — 是 real 中**信息量
+> 为零的公开格式串** (业界约定, 非 secret 内容), mock 复用它们不泄露任何 secret
+> 信息. C5 检查 (`src/mock.rs` 的 `c5_violated`) 在窗口比较前剥离 mock 的公开段
+> (Email 剥离 `@domain` 后缀, 仅查 local 段), 随机部分照常做 ≥k 子串窗口检查
+> (Auto 模式重试链语义不变). 豁免只覆盖公开段本身: 随机部分撞上 real 任意 ≥k 窗口
+> 仍算违反. **手动配置的 Email domain 必须 ∈ 白名单** (`GenSpec::validate` 强制,
+> #410 — 防 "固定段夹带真值并整段豁免" 的绕过面, 同 PublicPrefixed 白名单约束).
+> Phone 的骨架分隔符与 Username 的名字池无需豁免 (分隔符单字符 < k 阈值; 名字池
+> 是公开常量数据, 非 real 派生).
 
 **Properties**:
 - `prop_no_real_substring_ascii`: 对任意 ASCII secret, mock 不含其 ≥ k(L) 子串. 🔁→`prop_no_real_substring` (`src/redact.rs`) + `prop_c5_gen_candidate_auto_body_no_real_substring` (`src/mock.rs`)
@@ -536,7 +541,7 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 - `prop_c5_auto_mode_deterministic`: Auto 模式下, 内部重试链 (C5_INTERNAL_RETRIES=10000) 使失败概率 ~(1e-5)^10000 ≈ 0, 实质等价于确定性契约. ✅
 - `prop_c5_fixed_mode_validated_on_upsert`: Fixed 模式 / 用户 prefix 在 `validate_against_real` (upsert 时) 校验, 不合格的 secret 拒绝入库. 🔁→`mock_strategy_validate_against_real_rejects_fixed_equals_real` 等 mock.rs validate 组 (upsert 链路经 `SecretEntry::validate_and_resolve` 调用)
 - `prop_secret_with_mock_prefix_rejected`: secret value 含 `global_mock_prefix` 时被 `validate_value` 拒绝 (前缀非空时生效). 🔁→`validate_value_rejects_short_pua_and_mock_prefix` (`src/secrets.rs`) + `validate_value_rejects_mock_prefix` (`tests/integration.rs`)
-- `prop_category_shape_mock_equal_length` (2026-10, category-aware shape): 对任意 (category, real) 含定向构造的 PEM/JWT/公开前缀形态, Auto infer + `gen_candidate` 的 mock 总字符数 == real 总字符数 (等长不变量 — wire 字节量无扰动), 且 shape-aware C5 (公开段豁免后随机部分无 ≥k 子串) 成立. ✅ `src/mock.rs` (+ shape 单元组: `pem_mock_is_structured_and_equal_length` / `pem_mock_c5_exemption_covers_boundary_lines_only` / `jwt_mock_is_three_segment_and_equal_length` / `public_prefixed_mock_keeps_prefix_and_equal_length`; RED-6 交叉: `pem_secret_structured_mock_round_trip` `src/redact.rs`)
+- `prop_category_shape_mock_equal_length` (2026-10, category-aware shape; #410 扩展: category 值域 9 (含 Email/Phone/Username), kind 定向构造 7 (含 email/phone/username 形态) — 等长 + shape-aware C5 对新形状同样成立): 对任意 (category, real) 含定向构造的 PEM/JWT/公开前缀/email/phone/username 形态, Auto infer + `gen_candidate` 的 mock 总字符数 == real 总字符数 (等长不变量 — wire 字节量无扰动), 且 shape-aware C5 (公开段豁免后随机部分无 ≥k 子串) 成立. ✅ `src/mock.rs` (+ shape 单元组: `pem_mock_is_structured_and_equal_length` / `pem_mock_c5_exemption_covers_boundary_lines_only` / `jwt_mock_is_three_segment_and_equal_length` / `public_prefixed_mock_keeps_prefix_and_equal_length` / `email_mock_is_structured_and_equal_length` / `email_mock_c5_exemption_covers_domain_only` / `phone_mock_preserves_skeleton_and_equal_length` / `username_mock_is_name_like_and_equal_length` / `shape_infer_email_not_gated_by_category` / `shape_infer_space_fallbacks_to_plain` / `validate_email_domain_must_be_whitelisted_and_single_point` / `validate_phone_skeleton_and_digits_only_charset` / `validate_username_accepts_range_lengths` / `username_mock_manual_range_length_within_bounds` / `secret_category_all_covers_email_phone_username`; RED-6 交叉: `pem_secret_structured_mock_round_trip` `src/redact.rs`)
 
 ### RED-6 可逆性 (round-trip identity, 非流式)
 
@@ -579,27 +584,35 @@ lint 按 while-read 整串字面校验, glob 字符 `* ? [` 亦安全).
 - `prop_json_leaf_fallback_wired_in_fallback_branches`: 同协议 reader 拒绝 / 跨协议 reader 拒绝的端到端场景 (显式 `restore` 配置), 客户端收到还原后的 JSON + restored-via-fallback WARN (不带 secret 明文). 🔁→`buffered_reader_reject_restores_mock_via_json_leaf_fallback` + `cross_proto_reader_reject_restores_mock_via_json_leaf_fallback` (`tests/integration.rs`)
 - `prop_json_leaf_fallback_keys_untouched`: 只遍历字符串**值**叶子, Object key 不被改写. 🔁→`restore_json_leaves_fallback_leaves_object_keys_untouched` (`src/redact.rs`)
 
-### RED-9 per-secret 处理策略 (strategy: redact / reject / placeholder; protect 预留)
+### RED-9 per-secret 处理策略 (strategy: redact / reject / placeholder / monitor; protect 预留)
 
 **陈述**: `[[secrets.entries]]` 的 `strategy` 字段 (serde snake_case 枚举, 缺省 `redact` — 旧配置零改动) 定义该 Secret 真值在请求侧命中后的处理策略:
 
 - **redact (缺省, 现状)**: 透明替换 (real→mock), 行为由既有 RED-1..RED-8 管辖, 本契约对其零触碰.
 - **reject (#305 批1)**: 该 Secret 的真值出现于请求 IR 的任一字符串叶子 (扫描面与 RED-2 的 redact 遍历同源, 含 extra 叶子) → **整请求拒绝转发**: 客户端收 503 (`AppError::Unavailable`, 与 RED-4 fail_closed 同型), message 只含 secret id + reason 枚举, 不含 secret 明文 (SEC-2 同型); **零上游请求** (判定先于 mock 生成, 上游零命中). reject 是**显式策略而非降级** — 不受 `[redact] on_probe_exhausted` 模式影响 (fail_open 下同样拒绝, 与探测耗尽正交, SEC-10 的降级开关族不适用).
 - **placeholder (#305 批2 → RED-10)**: 请求侧命中替换为**明示假值** `[REDACTED:{secret_id}]`, 响应侧**不还原** + 蜜罐检测报警 (不干预转发) — 完整行为契约见 **RED-10**, 本条不重复陈述.
+- **monitor (#410)**: 真值出现于请求 IR 的任一字符串叶子 (扫描面与 redact 遍历同源) → **原样放行** (IR 零改写, 无 mock 生成, 不入 allocated — FWD-1 最干净形态: 对 wire 零修改), 位置分类命中计入**审计通道** (`RedactionMap.monitor_hits`, id-keyed 无真值) → usage redacts 落账 (mock 字段 = "(passthrough)" 标记, WebUI Redactions 视图呈现; 不进 record.redactions 替换投影) + 响应侧无 restore 交互 (real_to_mock 无条目) + 无蜜罐检测 (真值本已合法外发, 响应出现属正常). **显式授权语义**: 真值对上游可见是策略本身而非降级 — SEC-10 降级开关族与 `[redact] on_probe_exhausted` 不适用; #383 配置期两道 gate (短值/弱空间) 豁免 (不做 mock 生成, 同 reject/placeholder). 适合 "agent 需要真值干活 + 用户要可观测" 的场景 (如 email).
 - **protect (值域预留, fail-fast)**: serde 值域已定义但行为**搁置** (#305 完结决策, 2026-10-11 — 用户未想清语义; 初裁语义 "请求侧 mock 伪装 + 全响应 mock→placeholder" 保留在 `SecretStrategy::Protect` 变体 doc 供重启参考) — static 加载 / dynamic 加载 / WebUI upsert 凡遇此值, validate 报错拒绝 ("not implemented yet (shelved)", 防止以为受保护而实际静默失效); 重启时另立 issue 与新契约编号, 不预留编号.
 
 **向后兼容锚**: 缺省 `strategy = "redact"` 时, 全部既有 RED-* 契约 (RED-1..RED-8) 逐字不变 — 不加 strategy 的旧配置与旧请求行为零变化.
 
-**遍历顺序边界**: reject 判定面 = 该 secret 轮次开始时刻的 IR 命中 (与 redact 同一循环, 长值优先的既定顺序). 两个已知遮蔽交互 (与 mock_strategy 的同值歧义同型, 机密性均不破 — 真值不外发): ① 同值多 entry: `sort + dedup` 先者胜出, strategy 随先者 (redact 在前则 reject 意图不生效, 该值仍被 mock 替换); ② 嵌套子串: 长 redact secret 的值包含短 reject secret 的值时, 前者先行整体替换可遮蔽后者的命中 (请求以 mock 形式放行). 配置期若需绝对 reject 语义, 避免同值/嵌套值组合.
+**遍历顺序边界**: reject 判定面 = 该 secret 轮次开始时刻的 IR 命中 (与 redact 同一循环, 长值优先的既定顺序). 两个已知遮蔽交互 (与 mock_strategy 的同值歧义同型, 机密性均不破 — 真值不外发): ① 同值多 entry: `sort + dedup` 先者胜出, strategy 随先者 (redact 在前则 reject 意图不生效, 该值仍被 mock 替换); ② 嵌套子串: 长 redact secret 的值包含短 reject secret 的值时, 前者先行整体替换可遮蔽后者的命中 (请求以 mock 形式放行). monitor 同型遮蔽 (#410): ① 同值多 entry 先者胜 (redact 在前则 monitor 意图不生效, 该值仍被 mock 替换); ② 长 redact secret 嵌套包含 monitor 真值时先行整体替换, 遮蔽 monitor 命中 (该 span 以 mock 形态放行, monitor 零审计) — 语义与 reject 同型, 配置期若需绝对语义, 避免同值/嵌套值组合.
 
-**配置期弱配置拒绝 (#383 方案 D, 2026-10-21)**: `on_probe_exhausted = "fail_open"` (显式 opt-in) 时被跳过 secret 的 record 含真值回显 (读端点族 → WebUI), 与 **SEC-1** 冲突 — 裁决从配置期源头消灭 probing 耗尽的触发面, 而非登记契约例外. `SecretEntry::validate_and_resolve` choke point (static 加载 / dynamic 加载 / WebUI upsert 三条进入路径) 对 **redact 策略**新增两道 fail-fast 拒绝 (Err message 只含 id / 数字 / 建议, 不含 secret 明文 — SEC 红线): ① 手动配置的 gen_spec 候选空间 < `mock::MIN_CANDIDATE_SPACE_WARN` (2^20, 与 `redact::MOCK_PROBE_LIMIT` 同值) — Auto 路径经 widen 兜底恒达标, 命中的必是用户手动配置 (引导: 加宽 charset/length_range 或换 strategy); ② real < 4 chars — 等长约束下候选空间物理不可达 (上界 65³ ≈ 27 万 < 2^20), Auto widen 救不了 (引导: 换 reject/placeholder). reject / placeholder 不做 mock 生成 (无 probing 触发面), 不受两道 gate 约束 — 引导目标恒可达. Auto widen 兜底与 `on_probe_exhausted` 开关语义不变; 运行时残余触发面 = 仅空间达标但对抗构造的 IR (概率天文级), fail_closed 默认拒绝, fail_open 显式 opt-in 保留 (adversarial 应急).
+**配置期弱配置拒绝 (#383 方案 D, 2026-10-21)**: `on_probe_exhausted = "fail_open"` (显式 opt-in) 时被跳过 secret 的 record 含真值回显 (读端点族 → WebUI), 与 **SEC-1** 冲突 — 裁决从配置期源头消灭 probing 耗尽的触发面, 而非登记契约例外. `SecretEntry::validate_and_resolve` choke point (static 加载 / dynamic 加载 / WebUI upsert 三条进入路径) 对 **redact 策略**新增两道 fail-fast 拒绝 (Err message 只含 id / 数字 / 建议, 不含 secret 明文 — SEC 红线): ① 手动配置的 gen_spec 候选空间 < `mock::MIN_CANDIDATE_SPACE_WARN` (2^20, 与 `redact::MOCK_PROBE_LIMIT` 同值) — Auto 路径经 widen 兜底恒达标, 命中的必是用户手动配置 (引导: 加宽 charset/length_range 或换 strategy); ② real < 4 chars — 等长约束下候选空间物理不可达 (上界 65³ ≈ 27 万 < 2^20), Auto widen 救不了 (引导: 换 reject/placeholder/monitor). reject / placeholder / monitor 不做 mock 生成 (无 probing 触发面), 不受两道 gate 约束 — 引导目标恒可达. Auto widen 兜底与 `on_probe_exhausted` 开关语义不变; 运行时残余触发面 = 仅空间达标但对抗构造的 IR (概率天文级), fail_closed 默认拒绝, fail_open 显式 opt-in 保留 (adversarial 应急).
 
 **Properties**:
 - `prop_reject_strategy_503_zero_upstream_sec2_message`: 端到端 — reject secret 的真值出现于请求 → 客户端 503 + message 含 secret id 不含真值 (SEC-2 同型) + 上游零请求 (mockito 零命中). ✅ `tests/integration.rs::prop_reject_strategy_503_zero_upstream_sec2_message`
 - `prop_reject_strategy_hits_refuse_regardless_of_mode`: 单元 — 命中 → `Err(RedactError { reason: StrategyReject })`, 且 fail_open / fail_closed 两种 on_probe_exhausted 模式下同样拒绝 (显式策略不受降级配置影响). ✅ `src/redact.rs::prop_reject_strategy_hits_refuse_regardless_of_mode`
 - `prop_reject_strategy_miss_passes_through`: 单元 — reject secret 存在但未命中 (请求不含其真值) → 不触发拒绝, 其余 secret 正常 redact (`prop_reject_strategy_miss_preserves_other_secrets_redact`) / 请求正常转发 (集成回归 `prop_reject_strategy_unhit_forwards_normally`) (缺省路径零行为变化的回归面). ✅ `src/redact.rs::prop_reject_strategy_miss_passes_through` + `tests/integration.rs::prop_reject_strategy_unhit_forwards_normally`
 - `prop_validated_manual_gen_spec_meets_candidate_space_floor` (#383): redact 策略下, 任意手动配置的 gen_spec 经 `validate_and_resolve` 通过 ⟹ 候选空间 ≥ 2^20 (弱配置拒绝的 property 化 — 通过即强配置). ✅ `src/secrets.rs::prop_validated_manual_gen_spec_meets_candidate_space_floor`
-- `prop_short_real_redact_rejected_other_strategies_pass` (#383): 过短 real (恰 3 chars — 通过 validate_value 字节下限, 落在等长约束物理边界) — redact 恒被拒且 Err 引导 reject/placeholder 而不含真值 (SEC 红线); 引导目标 (reject/placeholder) 恒通过. ✅ `src/secrets.rs::prop_short_real_redact_rejected_other_strategies_pass`
+- `prop_short_real_redact_rejected_other_strategies_pass` (#383): 过短 real (恰 3 chars — 通过 validate_value 字节下限, 落在等长约束物理边界) — redact 恒被拒且 Err 引导 reject/placeholder/monitor (#410 起含 monitor) 而不含真值 (SEC 红线); 引导目标 (reject/placeholder/monitor) 恒通过. ✅ `src/secrets.rs::prop_short_real_redact_rejected_other_strategies_pass`
+- `prop_monitor_strategy_hits_pass_through_and_audits` (#410, 单元): monitor 真值命中 → IR 逐字节不变 (放行, 无 mock 生成) + `monitor_hits` 审计 (id + 位置分类, 不含真值) + `map.real_to_mock` 空 (无 restore 数据面). 🔁→`monitor_strategy_hits_pass_through_and_audits` (`src/redact.rs`)
+- `prop_monitor_and_redact_mixed_round_trip` (#410, 单元): 混合策略 (monitor + redact 并存) 互不干扰 — redact 条目照常替换 + round-trip (RED-6 对 redact 条目保持), monitor 条目放行 + 审计 (redact 命中不混入 monitor_hits, 反之亦然). 🔁→`monitor_and_redact_mixed_round_trip` (`src/redact.rs`)
+- `prop_monitor_strategy_unhit_no_audit` (#410, 单元): monitor secret 未命中 (请求不含其真值) → `monitor_hits` 空 (零噪声审计, 缺省路径零行为变化). 🔁→`monitor_strategy_unhit_no_audit` (`src/redact.rs`)
+- `prop_monitor_hits_derive_to_usage_projection` (#410, 单元): monitor 命中进 usage 审计投影 (`derive_redact_hits` 合并通道, mock 字段 = "(passthrough)"), 不进 record.redactions (`derive_redactions` 仅含替换通道 — 两投影分野). 🔁→`monitor_hits_derive_to_usage_projection` (`src/proxy/recorder.rs`)
+- `prop_monitor_short_real_exempt_from_gates` (#410): monitor 豁免 #383 两道配置期 gate (短 real / 弱空间 — 零 mock 生成无 probing 触发面, 同 reject/placeholder; 短值如 email 恒合法, 对比 redact 同值被拒). 🔁→`validate_allows_short_real_for_monitor` (`src/secrets.rs`)
+- `prop_monitor_strategy_upstream_sees_real_value_and_audits` (#410, 端到端): 上游收到的 body 含真值原样 (放行, 零改写) + 客户端响应透传 + usage redacts 审计落账 (by_secret 聚合含 "(passthrough)"). 🔁→`monitor_strategy_upstream_sees_real_value_and_audits` (`tests/integration.rs`)
+- `prop_email_category_mock_realistic_upstream` (#410, 端到端): email 类 secret (redact 策略) → 上游 body 见拟真等长 mock 不见真值 (白名单域名段保留), 客户端 restore 真值 (RED-6). 🔁→`email_category_mock_is_realistic_upstream` (`tests/integration.rs`)
 
 ### RED-10 placeholder 策略 (明示假值 + 蜜罐检测)
 
@@ -1635,6 +1648,11 @@ chars (char boundary 安全); 其余事件字段为受控类型, 天然无 secre
 **一致性**: `map.hits` 的分类计数 == 替换遍历覆盖的叶子集 (`StringLeafOps` 单一
 实现), 统计于替换前的只读遍历.
 
+> **monitor 通道 (#410)**: monitor 策略命中 (真值放行, 无替换发生) 经
+> `RedactionMap.monitor_hits` 并入同一落账管线 (`derive_redact_hits`, mock 列 =
+> 常量 "(passthrough)"), 行为契约登记在 **RED-9** — 本节既有 property 的
+> "替换遍历" 限定不受影响.
+
 **Properties**:
 - `prop_usage_redact_persist_no_secret`: 持久化行 (含 mock) 过 active secrets 扫描永不命中 — 命中 secret 子串的 mock 整体替换为 `<redacted:mock>` (C5 防御纵深). 🔁→`record_redactions_expands_categories_and_sanitizes_mock` (`src/usage/mod.rs`)
 - `prop_usage_redact_category_expansion`: per (secret, category) 展开保真 — hits 之和 == 分类计数之和, categories 聚合 == 明细 fold, 全零 locations → 零行. 🔁→`record_redactions_expands_categories_and_sanitizes_mock` + `record_redactions_noop_on_disabled_or_zero_locations` (`src/usage/mod.rs`)
@@ -1871,3 +1889,4 @@ capture/submit 均为 no-op, 转发热路径与无本模块时逐字节一致. o
 | 2026-10-21 | RED-9 (增补) + RED-4 / SEC-10 / SEC-1 (触发面收窄) | **配置期弱配置拒绝 (#383 方案 D)**: `SecretEntry::validate_and_resolve` choke point 对 redact 策略新增两道 fail-fast 拒绝 — ① 手动 gen_spec 候选空间 < 2^20 (`MIN_CANDIDATE_SPACE_WARN`, 自 lint WARN 升级; Auto 路径 widen 兜底恒达标, 命中的必是手动配置); ② real < 4 chars (等长约束下空间物理不可达, 上界 65³ ≈ 27 万; 引导 reject/placeholder — 两策略不做 mock 生成, 不受 gate 约束). Err message 只含 id/数字/建议 (SEC 红线). Auto widen 兜底与 `on_probe_exhausted` 开关语义不变; RED-4 耗尽触发面残余 = 仅空间达标但对抗构造的 IR, SEC-10 fail_open 的 record 真值回显与 SEC-1 的冲突面随之收敛至 ≈ 0 — 裁决维持不登记 SEC-1 例外 (方案 C 随 D 成立而无必要). 新增 2 条 property (`prop_validated_manual_gen_spec_meets_candidate_space_floor` / `prop_short_real_redact_rejected_other_strategies_pass`) + 既有测试 `validate_and_resolve_leaves_weak_spec_lintable` 语义翻转为 `validate_and_resolve_rejects_weak_manual_gen_spec` | issue #383 用户裁决 (2026-10-21 23:11): "采纳方案D, 配置期拒绝, 对于过短的 secret, 引导用户选择其他方案" — fail_open 时被跳过 secret 的 record 含真值回显 WebUI 与 SEC-1 冲突, 从配置期源头消灭触发面优于登记契约例外 |
 | 2026-10-23 | PRIV-1..5 + SEC-12 + SEC-3 扩充 + SEC-1 注记 + CFG-8 + UI-5 (#361 收编批) | 第 1-5 项实施: ① 增设 PRIV 域 §13 (五条红线, 原文 `src/privacy.rs` 头部正文化, 红线①挂既有 e2e); ② 幽灵编号收编 — SEC-AUTH-1/2/3 → **SEC-12** (a/b/c 子句, OIDC 登录链), SEC-C4/C4a/C4b → **SEC-3** (URL/日志脱敏族并入, 新增 `prop_safe_url_log_strips_sensitive_components`), 15 处代码注释改指; ③ SEC-1 两处边界注记 (privacy alerts 例外正文化 — 先例 PR #303; fail_open 边界按 #383 方案 D 裁决**不登记**、加指针); ④ **CFG-8** privacy_scan_groups (镜像 CFG-7: RMW + 位掩码 + PUT 语义); ⑤ UI-5 措辞外部化 (实现禁令 → 可观察断言, 量测保留). **行为零变更** (全为文档/注释级, 新增 11 条 property 全部🔁挂既有测试) | issue #361 lc90 "确认实施" (2026-10-23) |
 | 2026-10-26 | FWD-2 (精确化, #402) | **Anthropic 响应 usage 未建模子字段 + 响应顶层未建模字段 extra 捕获回写** (known-limitations "L8 残余面" 条目② 的修复): ① `IrUsage.extra` (usage 内 `cache_creation` TTL 分解 / `server_tool_use` / `service_tier` / `speed` / `output_tokens_details` / `inference_geo` / 未来 key) + `IrResponse.extra` (顶层 `container`/`diagnostics`/`stop_details`/未来 key, null verbatim) — 仅 a reader 收集 / 仅 a writer 回写 (已建模四元组与顶层字段保持 typed, 防双源冲突); 非流式与流式共用 read_usage/write_usage (message_start/delta 自动覆盖, a→a redact 流式 restore 同保真); ② 响应侧清空 seam = `IrResponse::clear_wire_fidelity` (非流式 cross_proto, record 先按 LLM 视角捕获再清) + StreamTranslate 跨协议模式剥 usage.extra (same-proto restore 模式保留 — gate 在 cross_proto); ③ redact restore 扫描面 (StringLeafOps for IrResponse) 扩至两处 extra 嵌套叶子; ④ B1 派生链 threading: `ResponseData.resp_extra` → `derive::response_parsed_from_parts` 回填 (consistency 守卫 VIEW-2 比对必要字段), usage 随 `Option<IrUsage>` 整体自动通过; ⑤ 生成器两轴 (`arb_anthropic_usage_extra` / `arb_anthropic_response_extra`, key 固定命名防与 known 键碰撞) 进 `anthropic_response_preserves_wire_semantics` 守卫面 (无新增 prop_ 行 — 覆盖度即契约边界原则). 残余边界 (登记 known-limitations): 流式响应顶层 extra 不进 IR (SSE 事件无原文容器); 跨协议显式丢弃 (与请求侧 extra 同型) | issue #402 |
+| 2026-10-28 | RED-9 (增补) + RED-5 (豁免段扩展) | **monitor 策略 + email/phone/username 仿真形状 (#410 Wave 2)**: ① RED-9 值域加 `monitor` — 真值命中 → 原样放行 (IR 零改写, 对 wire 零修改 — FWD-1 最干净形态) + 位置分类计入审计通道 (`RedactionMap.monitor_hits`, id-keyed 无真值) 经 `derive_redact_hits` 进 usage redacts (mock 字段 = "(passthrough)"), 不进 record.redactions 替换投影; 显式授权语义 — 真值对上游可见是策略本身而非降级 (SEC-10 / on_probe_exhausted 不适用), #383 两道配置期 gate 豁免 (同 reject/placeholder); 遮蔽边界与 reject 同型登记; 新增 7 条 property (5 单元 + 2 端到端, 见 RED-9 Properties). ② RED-5 公开格式子串豁免段加 Email 的 `@domain` 白名单域名段 (`EMAIL_DOMAINS`) — 手动配置 domain 必须 ∈ 白名单 (validate 强制, 同 PublicPrefixed 白名单约束, 防 "固定段夹带真值并整段豁免" 绕过面); Phone 分隔符与 Username 名字池无需豁免 (分隔符单字符 < k / 名字池是公开常量非 real 派生); `prop_category_shape_mock_equal_length` 描述扩展 (category 值域 9 × kind 定向构造 7) + shape 单元组补列 T1 测试 | issue #410: monitor 适合 "agent 需要真值干活 + 用户要可观测" 的场景 (如 email); 拟真形状提升归类 email/phone/username secret 的 mock 仿真度 (空间 gate 不足退化 plain, 等长与 C5 不变) |

@@ -433,17 +433,18 @@ services.secret-guard.providers.glm-pool = {
 |---|---|---|---|
 | `id` | string | (必填) | 唯一标识, 规则同 provider id. |
 | `name` | string | — | 可选的人类可读名称 (仅 WebUI 显示). |
-| `category` | string | `"apikey"` | 类别: `password` / `apikey` / `token` / `cookie` / `privatekey` / `other`. 参与 mock 形状推断 (2026-10 起): `privatekey` + 多行 PEM 真值 → 结构化假 PEM; `token` + JWT 形状真值 → 三段点分替身; `apikey` + 公开前缀真值 (`sk-`/`ghp_`/`AKIA`...) → 保留前缀; 其余 (含类别与真值形状不匹配) 退化为平坦等长随机串 — **归类错误无害**. `global_mock_prefix` 非空时恒用平坦串 (辨识前缀与结构仿真互斥). 标注与真值形状矛盾时启动 WARN (PEM 矛盾 = 提醒改标注保持所见/所为一致; JWT/公开前缀矛盾 = 提醒改标注可启用结构化仿真); 标注无误但形状不符 (如随机串 token) 不告警. |
-| `value` | string | `""` | secret 明文. 最少 3 字节; **`strategy = "redact"` (缺省) 时还需 ≥4 字符** — 更短的值在等长约束下候选空间物理不足 (mock 探测必耗尽), 配置直接报错并引导改用 `reject` / `placeholder` 策略; 不允许包含 `global_mock_prefix`; 不允许包含 Unicode 私用区字符 (U+E000..U+F8FF). 与 `value_file` 互斥. |
+| `category` | string | `"apikey"` | 类别: `password` / `apikey` / `token` / `cookie` / `privatekey` / `email` / `phone` / `username` / `other`. 参与 mock 形状推断 (2026-10 起): `privatekey` + 多行 PEM 真值 → 结构化假 PEM; `token` + JWT 形状真值 → 三段点分替身; `apikey` + 公开前缀真值 (`sk-`/`ghp_`/`AKIA`...) → 保留前缀; `email` — 值匹配 email 形态时 (不论类别, 形状自证) 生成拟真地址: name-like local + 白名单公开域名 (real 的域在白名单内则保留); local 段空间不足时退化为平坦串; `phone` — 值需为数字+分隔符形态且 ≥7 数字位, 保持分隔符骨架; `username` — 值需够长以支撑拟真句柄空间 (名字池+数字补位), 过短退化平坦串; 其余 (含类别与真值形状不匹配) 退化为平坦等长随机串 — **归类错误无害**. `global_mock_prefix` 非空时恒用平坦串 (辨识前缀与结构仿真互斥). 标注与真值形状矛盾时启动 WARN (PEM/email 矛盾 = 行为已按形状结构化, 提醒改标注保持所见/所为一致; JWT/公开前缀矛盾 = 提醒改标注可启用结构化仿真); 标注无误但形状不符 (如随机串 token) 不告警. |
+| `value` | string | `""` | secret 明文. 最少 3 字节; **`strategy = "redact"` (缺省) 时还需 ≥4 字符** — 更短的值在等长约束下候选空间物理不足 (mock 探测必耗尽), 配置直接报错并引导改用 `reject` / `placeholder` / `monitor` 策略; 不允许包含 `global_mock_prefix`; 不允许包含 Unicode 私用区字符 (U+E000..U+F8FF). 与 `value_file` 互斥. |
 | `value_file` | path | — | 启动时一次性从文件读取 (适合 sops-nix 等外部注入), 读取失败会**拒绝启动** (fail-fast: secret 缺失会让保护静默失效, 必须在部署时暴露). 文件内容自动去首尾空白. |
 | `mock_strategy` | table | (见下) | 替身 (mock) 的生成策略. 缺省时自动按真值推断: 等长、同字符集的确定性随机值. |
-| `strategy` | string | `"redact"` | 该 secret 命中后的处理策略, 四值语义见下. |
+| `strategy` | string | `"redact"` | 该 secret 命中后的处理策略, 五值语义见下. |
 
-**`strategy` 四值语义**:
+**`strategy` 五值语义**:
 
 - `redact` (默认): 现状行为 — 真值命中请求时透明替换为 mock, 响应回传时还原. 缺省零改动.
 - `reject`: 真值命中请求 → **整请求拒绝转发** — 客户端收 503, 错误信息只含 secret id 不含真值, 且**零上游外发** (适合 "绝不允许离开本机" 的高危值, 如生产数据库密码).
 - `placeholder`: 真值命中请求时替换为**明示假值** `[REDACTED:{secret_id}]` — LLM 能看出该值已被脱敏 (非仿真替身); 响应回传时**不还原** (placeholder 原样保留), 同时开启**蜜罐检测**: 本请求配置的全部 placeholder secret 真值一旦出现在 LLM 响应中, 立即报警 — 日志 WARN + 记录打标, WebUI 时间线轮次显示警示徽章 (列出 secret id), 但**不拦截转发** (客户端透传看到真值 = 立即看到泄露证据); 报警内容只含 secret id, 不含真值. 适合 "希望模型知道此处有敏感值 + 想知道是否已泄露" 的蜜罐场景.
+- `monitor`: 真值命中请求 → **原样放行** (不替换不拒绝, 上游收到真值) + 命中位置计入脱敏审计 (usage 视图 Redactions 显示 "(passthrough)") — 适合 agent 需要真值工作 (如 email) 且用户要留痕的场景; 显式授权, 与降级配置无关.
 - `protect`: **已搁置** (#305 完结时用户未想清语义) — 配置即启动报错 (`not implemented yet`), 防止以为受保护而实际静默失效. 若未来重启, 会另立 issue 与契约.
 
 ```toml
@@ -452,6 +453,7 @@ id = "prod-db-password"
 value = "..."
 strategy = "reject"        # 命中即拒绝转发; 缺省 redact 可省略
 # strategy = "placeholder" # 命中替换为 [REDACTED:{id}] 明示假值 + 响应侧蜜罐检测
+# strategy = "monitor"     # 放行 + 审计 (上游见真值, usage 留痕)
 ```
 
 ### `mock_strategy` 子表

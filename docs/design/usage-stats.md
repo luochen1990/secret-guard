@@ -146,7 +146,9 @@ secret × 每非零位置分类; v4b 治理三问扩展)
 {
   "ts": "...", "hour": "...",          // 同上
   "secret_id": "github-token",         // 受控 id (config schema, 无 secret 明文)
-  "mock": "sgm_...",                   // 替换值 (C5 保证 + 防御纵深扫描, USAGE-6/7)
+  "mock": "sgm_...",                   // 替换值 (C5 保证 + 防御纵深扫描, USAGE-6/7);
+                                       //   monitor 策略命中为常量 "(passthrough)" (#410,
+                                       //   真值放行 — 无替换发生, 仅留痕)
   "category": "system",                // v4b 位置分类: system|tools|user|history|other
                                        //   (C 级结构化落地 — 只存位置不存内容;
                                        //    语义: system=提示词污染, tools=工具定义,

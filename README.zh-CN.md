@@ -35,7 +35,9 @@ claude-code / opencode / hermes-agent 这类 Agent 工具 (即本地的 Agent Ha
   `strategy = "reject"`, 请求一旦含该真值立即拒绝转发 (503) — 适用于绝不允许离开
   本机的凭证; 或 `strategy = "placeholder"`, 命中即替换为明示假值 `[REDACTED:{id}]`
   且响应侧不还原 — 每个 placeholder secret 同时是蜜罐: 真值一旦出现在 LLM 响应中
-  立即报警 (日志 WARN + WebUI 时间线徽章, 报警不含真值), 响应本身照常透传。
+  立即报警 (日志 WARN + WebUI 时间线徽章, 报警不含真值), 响应本身照常透传; 或
+  `strategy = "monitor"`, 真值原样放行 (agent 需要真值干活的场景, 如 email 地址),
+  命中留痕进脱敏审计 (usage 视图显示 "(passthrough)")。
 - **SG 自有凭证内置保护**: secret-guard 自己签发的 sg API token 与你登记的 provider
   API key 自动受保护 — 零配置, token 创建即生效。即使 prompt injection 诱导 Agent
   把自己的网关 token 粘进对话, LLM 厂商也只会看到等长的 Mock。
